@@ -17,8 +17,8 @@ struct ContentView: View {
     @State private var isRunning = false
 
     private let depthProcessor: DepthProcessor? = DepthProcessor()
-    @State private var cancellable: AnyCancellable?
     @State private var lastBufferProcessingDate = Date.distantPast
+    @State private var cancellable: AnyCancellable? = nil
 
     var body: some View {
         ScrollView {
@@ -91,13 +91,13 @@ struct ContentView: View {
             cancellable = navigator.$lastPixelBuffer
                 .compactMap { $0 }
                 .receive(on: DispatchQueue.main)
-                .sink { sample in
+                .sink { pixelBuffer in
                     let now = Date()
                     if now.timeIntervalSince(lastBufferProcessingDate) < (1.0 / 5.0) { return }
                     lastBufferProcessingDate = now
 
                     guard let depthProcessor = depthProcessor else { return }
-                    depthProcessor.process(sampleBuffer: sample as! CMSampleBuffer) { result in
+                    depthProcessor.process(pixelBuffer: pixelBuffer) { result in
                         guard let result = result else { return }
                         self.depthImage = result.colorizedImage
                         regionStates = result.regionAverages.map {
@@ -107,8 +107,9 @@ struct ContentView: View {
                 }
         }
         .onDisappear {
-            cancellable?.cancel()
             navigator.stopNavigation()
+            cancellable?.cancel()
+            cancellable = nil
         }
     }
 }

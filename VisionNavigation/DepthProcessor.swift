@@ -26,12 +26,17 @@ final class DepthProcessor {
         self.request.imageCropAndScaleOption = .scaleFill
     }
 
+    // Keep the original API for callers that have CMSampleBuffer
     func process(sampleBuffer: CMSampleBuffer, completion: @escaping (DepthAnalysisResult?) -> Void) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             completion(nil)
             return
         }
+        process(pixelBuffer: pixelBuffer, completion: completion)
+    }
 
+    // New API that matches what VisionNavigator publishes
+    func process(pixelBuffer: CVPixelBuffer, completion: @escaping (DepthAnalysisResult?) -> Void) {
         requestQueue.async {
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
             do {
@@ -89,7 +94,6 @@ final class DepthProcessor {
         let rowBytesSrc = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
         floats.withUnsafeMutableBytes { dstBytes in
-            // Destination pointer must outlive the vImage call; the closure guarantees scope.
             var srcBuffer = vImage_Buffer(
                 data: base,
                 height: vImagePixelCount(height),
