@@ -32,7 +32,7 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     private var captureSession: AVCaptureSession?
 
     // Optical flow
-    private var lastPixelBuffer: CVPixelBuffer?
+    @Published var lastPixelBuffer: CVPixelBuffer?
     private let ciContext = CIContext()
 
     // MARK: - Init
