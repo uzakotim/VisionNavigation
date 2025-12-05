@@ -21,6 +21,14 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     @Published var isRunning: Bool = false
     @Published var status: String = "Idle"
 
+    // Depth output for UI
+    @Published var depthImage: UIImage? = nil
+    @Published var regionStates: [String] = ["FAR", "FAR", "FAR"]
+
+    // Parameterized speeds for region-based navigation
+    @Published var nearTurnSpeed: Int = 120   // used where previously "120"
+    @Published var farForwardSpeed: Int = 100 // used where previously "100"
+
     // MARK: - Public API
     var onLog: ((String) -> Void)?
 
@@ -34,6 +42,16 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     // Optical flow
     @Published var lastPixelBuffer: CVPixelBuffer?
     private let ciContext = CIContext()
+
+    // Depth processing
+    private let depthProcessor: DepthProcessor? = DepthProcessor()
+    private var lastBufferProcessingDate: Date = .distantPast
+    private let processingFPS: Double = 5.0
+
+    // Command coalescing / rate limiting
+    private var lastSentCommand: String?
+    private var lastSendDate: Date = .distantPast
+    private let minSendInterval: TimeInterval = 0.15
 
     // MARK: - Init
     init(targetIP: String, port: UInt16) {
@@ -125,10 +143,77 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         guard isRunning else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        if let last = lastPixelBuffer {
-            analyzeOpticalFlow(prev: last, curr: pixelBuffer)
-        }
+        // Existing optical flow logic
+//        if let last = lastPixelBuffer {
+//            analyzeOpticalFlow(prev: last, curr: pixelBuffer)
+//        }
         lastPixelBuffer = pixelBuffer
+
+        // Throttled depth processing (≈5 FPS)
+        let now = Date()
+        if now.timeIntervalSince(lastBufferProcessingDate) >= (1.0 / processingFPS) {
+            lastBufferProcessingDate = now
+            if let depthProcessor = depthProcessor {
+                depthProcessor.process(pixelBuffer: pixelBuffer) { [weak self] result in
+                    guard let self = self, let result = result else { return }
+                    // Publish to UI
+                    self.depthImage = result.colorizedImage
+                    self.regionStates = result.regionAverages.map { $0 < 0.5 ? "FAR" : "NEAR" }
+
+                    // Decide and send command based on regions (parameterized + deduplicated)
+                    let cmd = self.commandForRegionStates(self.regionStates)
+                    self.sendCommand(cmd)
+                    self.status = "sending command \(cmd)"
+                }
+            }
+        }
+    }
+
+    // MARK: - Region-based command decision
+    // Map [left, center, right] states to a command string.
+    private func commandForRegionStates(_ states: [String]) -> String {
+        let l = states[0], c = states[1], r = states[2]
+
+        let turn = 150
+        let forward = 80
+
+        // Consolidated logic from original if-chain:
+        if l == "NEAR" && c == "NEAR" && r == "NEAR" {
+            return "q \(turn)"
+        }
+        if l == "FAR" && c == "FAR" && r == "FAR" {
+            return "w \(forward)"
+        }
+        if l == "NEAR" && c == "FAR" && r == "FAR" {
+            return "e \(turn)"
+        }
+        if l == "FAR" && c == "NEAR" && r == "FAR" {
+            return "q \(turn)"
+        }
+        if l == "FAR" && c == "FAR" && r == "NEAR" {
+            return "q \(turn)"
+        }
+        if l == "FAR" && c == "NEAR" && r == "NEAR" {
+            return "q \(turn)"
+        }
+        if l == "NEAR" && c == "FAR" && r == "NEAR" {
+            return "w \(forward)"
+        }
+        if l == "NEAR" && c == "NEAR" && r == "FAR" {
+            return "e \(turn)"
+        }
+        return "k 0"
+    }
+
+    private func sendCommandCoalesced(_ cmd: String) {
+        // Avoid sending the same command too frequently
+        let now = Date()
+        if cmd == lastSentCommand, now.timeIntervalSince(lastSendDate) < minSendInterval {
+            return
+        }
+        lastSentCommand = cmd
+        lastSendDate = now
+        sendCommand(cmd)
     }
 
     // MARK: - Optical Flow
@@ -145,11 +230,11 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         let spd = max(0, min(255, Int(speed)))
 
         if abs(diff) < threshold {
-            sendCommand("w \(spd)") // forward
+            sendCommandCoalesced("w \(spd)") // forward
         } else if diff > 0 { // right side obstacle
-            sendCommand("q \(spd)") // turn left
+            sendCommandCoalesced("q \(spd)") // turn left
         } else { // left side obstacle
-            sendCommand("e \(spd)") // turn right
+            sendCommandCoalesced("e \(spd)") // turn right
         }
     }
 
@@ -175,8 +260,6 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
 
     // MARK: - UDP
     private func sendCommand(_ cmd: String) {
-        // Ensure connection matches current ip/port if user edited fields
-        // (A simple approach: reconnect on every send if ip/port changed could be heavy; instead, expose a manual reconnect or observe changes.)
         if udpConnection == nil {
             setupConnection()
         }
