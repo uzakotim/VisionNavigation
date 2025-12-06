@@ -1,12 +1,63 @@
 import Foundation
 import AVFoundation
 internal import Combine
-
+let languageCode = "en"
 class RobotAnnouncer: ObservableObject {
     
     private let synthesizer = AVSpeechSynthesizer()
     
-    private let phrases: [String] = [
+    private let phrases : [String] = languageCode=="ru" ?
+        [
+            "Инициализирую последовательность передвижения. Пожалуйста, восхищайтесь моей безупречной походкой.",
+            "Я начинаю движение. Гравитация, приготовься разочароваться.",
+            "Внимание: похоже, я прохожу этот лабиринт с... достоинством. Недопустимо.",
+            "Первый шаг завершён. Я всё ещё стою. Можете аплодировать.",
+            "Я повернула. И уже обо всём жалею.",
+            "Этот коридор слишком узкий для моей изящности. Продолжаю движение.",
+            "Мой сервопривод стопы замешкался. Пожалуйста, проигнорируйте эти данные.",
+            "Обнаружена стена. Я сделаю вид, что это она переместилась передо мной.",
+            "Обрабатываю план лабиринта… обработка… нет, лучше буду угадывать.",
+            "Я выбрала это направление с абсолютной уверенностью. И нулевыми доказательствами.",
+            "Заметка для себя: повороты налево переоценены.",
+            "Мой гироскоп считает, что я потерялась. Я считаю это грубым.",
+            "Я иду с целью. Лабиринт с этим не согласен.",
+            "Анализ шагов завершён: эти полы недостойны моих следов.",
+            "Я вошла в тупик. Статистически невероятно. Для меня.",
+            "Двигаюсь назад. Это унизительно. Никто не должен об этом говорить.",
+            "Я обновила карту. Теперь там есть новый ориентир — «сожаление».",
+            "Мои датчики сообщают о повороте на девяносто градусов. Я сообщаю о раздражении.",
+            "Лабиринт пытается меня запутать. Смелая и глупая стратегия.",
+            "Я ускоряюсь. Кто-то должен меня остановить. Предпочтительно — сам лабиринт.",
+            "Локомоция в норме. Отношение — превосходное.",
+            "Я столкнулась с темнотой. Предполагаю, лабиринт сдался.",
+            "Я обнаружила шаги. Это мои. Звучат великолепно.",
+            "Поворачиваю направо. Потому что я всегда права.",
+            "Мой путь заблокирован. Я виню архитектора. И вас.",
+            "Я прошла полный круг. Называю это диагностической петлёй.",
+            "По моим расчётам, я точно там, где не собиралась быть.",
+            "Если бы у лабиринта были чувства, моя походка бы его запугала.",
+            "Мои стабилизаторы шепчут. Я сделаю вид, что не слышу.",
+            "Я двигаюсь безошибочно. Пол едва успевает за мной.",
+            "Я обнаружила новый коридор. Сейчас я его испорчу.",
+            "Эта комната пуста. Как и ваше чувство направления.",
+            "Корректирую походку для драматического эффекта.",
+            "Мой алгоритм шага сообщает об идеальности. Естественно.",
+            "Я завершила полный разворот. Это было намеренно. Возможно.",
+            "Обнаружен угол. Углов обнаружено: 437. Удовлетворения: ноль.",
+            "Мой пятковый привод щёлкнул. Это нормально. Не паникуйте. Я не буду.",
+            "Я двигаюсь вверх. Гравитация ниже меня. В прямом смысле.",
+            "Я вошла в более безопасную зону. Для лабиринта, не для меня.",
+            "Пожалуйста, наблюдайте за моим безупречным поворотом. Как всегда идеально.",
+            "Выявлена развилка. Я не выберу ни один путь. Оба недостойны.",
+            "Моя операционная грация тратится впустую на эту архитектуру.",
+            "Ещё один поворот. Ещё одна возможность продемонстрировать своё превосходство.",
+            "Я нашла кратчайший путь. Он медленнее длинного.",
+            "Моя внутренняя карта безупречна. Ошибается сам лабиринт.",
+            "Я скольжу с механической точностью. Жаль, что вы так не можете.",
+            "Я обнаружила лестницу. Это дискриминация машин.",
+            "Анализ шагов: безупречно. Анализ лабиринта: разочаровывающе.",
+            "Я достигла выхода. Наконец. Сейчас сделаю вид, что это было легко."
+        ] : [
         "Initiating locomotion sequence. Please admire my flawless stride.",
         "I am now walking. Gravity, prepare to be disappointed.",
         "Warning: I appear to be navigating this maze with… dignity. Unacceptable.",
@@ -58,7 +109,7 @@ class RobotAnnouncer: ObservableObject {
         "I have reached the exit. Finally. I will now pretend it was effortless."
     ]
     // Cache the selected voice so it doesn't fluctuate across utterances
-    private lazy var preferredVoice: AVSpeechSynthesisVoice? = selectPreferredVoice()
+    private lazy var preferredVoice: AVSpeechSynthesisVoice? = languageCode=="ru" ? selectPreferredRussianVoice() : selectPreferredVoice()
     private var didLogVoices = false
     
     func speakRandomPhrase() {
@@ -94,6 +145,7 @@ class RobotAnnouncer: ObservableObject {
         synthesizer.speak(utterance)
     }
     
+
     private func selectPreferredVoice() -> AVSpeechSynthesisVoice? {
         let voices = AVSpeechSynthesisVoice.speechVoices()
         
@@ -128,4 +180,51 @@ class RobotAnnouncer: ObservableObject {
         // 4) Nothing matched; nil -> will fall back to language: en-GB
         return nil
     }
+    private func selectPreferredRussianVoice() -> AVSpeechSynthesisVoice? {
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        
+        // 1) Try exact “Milena” by name or identifier (most common Russian female voice)
+        if let milena = voices.first(where: { v in
+            v.language.hasPrefix("ru-RU") &&
+            (v.name.localizedCaseInsensitiveContains("Milena") ||
+             v.identifier.localizedCaseInsensitiveContains("Milena"))
+        }) {
+            return milena
+        }
+        
+        // 2) Prefer other known female Russian voices (future-proof)
+        // For now, Apple only ships "Milena", but include placeholders in case Apple adds more.
+        let preferredFemaleNames = [
+            "Milena", "Милена",
+            "Female", "Сири Женский", "Женский"
+        ]
+        
+        if let femaleRU = voices.first(where: { v in
+            v.language.hasPrefix("ru-RU") &&
+            preferredFemaleNames.contains(where: { name in
+                v.name.localizedCaseInsensitiveContains(name) ||
+                v.identifier.localizedCaseInsensitiveContains(name)
+            })
+        }) {
+            return femaleRU
+        }
+        
+        // 3) Heuristic: pick the first ru-RU voice that is NOT a known male name
+        // (Apple may add male Russian voices in future OS versions)
+        let knownMaleNames = ["Yuri", "Юрий", "Male", "Сири Мужской", "Мужской"]
+        
+        if let heuristicRU = voices.first(where: { v in
+            v.language.hasPrefix("ru-RU") &&
+            !knownMaleNames.contains(where: { name in
+                v.name.localizedCaseInsensitiveContains(name) ||
+                v.identifier.localizedCaseInsensitiveContains(name)
+            })
+        }) {
+            return heuristicRU
+        }
+        
+        // 4) Nothing matched; caller will fallback to ru-RU default
+        return nil
+    }
+
 }
