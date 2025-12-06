@@ -15,9 +15,13 @@ final class DepthProcessor {
     private var request: VNCoreMLRequest!
 
     init?() {
-        guard let model = try? DepthAnythingV2SmallF16(configuration: MLModelConfiguration()).model,
+        // Prefer ANE when available; avoid GPU for lower thermals/energy.
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuAndNeuralEngine
+
+        guard let model = try? DepthAnythingV2SmallF16(configuration: config).model,
               let vnModel = try? VNCoreMLModel(for: model) else {
-            print("❌ Failed to load DepthAnythingV2.mlmodel")
+            print("❌ Failed to load DepthAnythingV2SmallF16.mlmodel")
             return nil
         }
 
@@ -63,8 +67,15 @@ final class DepthProcessor {
             }
 
             let (minVal, maxVal) = self.minMax(of: depthValues)
+            // Guard against non-finite or degenerate ranges
+            if !minVal.isFinite || !maxVal.isFinite || maxVal <= minVal {
+                print("⚠️ Invalid depth range min:\(minVal) max:\(maxVal)")
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+
             let normalized = depthValues.map {
-                CGFloat((($0 - minVal) / (maxVal - minVal + 1e-6)).clamped(to: 0...1))
+                CGFloat((($0 - minVal) / (maxVal - minVal)).clamped(to: 0...1))
             }
 
             let colorImage = self.colorMap(from: normalized, width: width, height: height)
@@ -93,7 +104,7 @@ final class DepthProcessor {
         // Convert Float16 → Float32
         let rowBytesSrc = CVPixelBufferGetBytesPerRow(pixelBuffer)
 
-        floats.withUnsafeMutableBytes { dstBytes in
+        let status: vImage_Error = floats.withUnsafeMutableBytes { dstBytes in
             var srcBuffer = vImage_Buffer(
                 data: base,
                 height: vImagePixelCount(height),
@@ -106,7 +117,13 @@ final class DepthProcessor {
                 width: vImagePixelCount(width),
                 rowBytes: width * MemoryLayout<Float>.size
             )
-            vImageConvert_Planar16FtoPlanarF(&srcBuffer, &dstBuffer, 0)
+            return vImageConvert_Planar16FtoPlanarF(&srcBuffer, &dstBuffer, 0)
+        }
+
+        if status != kvImageNoError {
+            // If conversion fails, return empty to let caller handle gracefully
+            print("❌ vImageConvert_Planar16FtoPlanarF failed: \(status)")
+            return ([], width, height)
         }
 
         return (floats, width, height)

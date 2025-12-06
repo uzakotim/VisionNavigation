@@ -8,14 +8,20 @@
 import SwiftUI
 internal import Combine
 import CoreMedia
+import AVFoundation
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var navigator = VisionNavigator(targetIP: "192.168.1.4", port: 8080)
     @State private var isLandscape: Bool = UIDevice.current.orientation.isLandscape
     @State private var isRunning = false
     @StateObject private var announcer = RobotAnnouncer()
     @State private var speechTask: Task<Void, Never>? = nil
     @State private var speechIntervalSeconds: Double = 12 // adjust as desired
+
+    // Debounce reconnection when user edits IP/port fields
+    @State private var ipCancellable: AnyCancellable?
+    @State private var portCancellable: AnyCancellable?
 
     var body: some View {
         ScrollView {
@@ -29,6 +35,9 @@ struct ContentView: View {
                         Text("IP:")
                         TextField("192.168.1.4", text: $navigator.ip)
                             .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
                     }
                     .padding(.horizontal)
 
@@ -36,6 +45,9 @@ struct ContentView: View {
                         Text("Port:")
                         TextField("8080", text: $navigator.port)
                             .textFieldStyle(.roundedBorder)
+                            .keyboardType(.numberPad)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
                     }
                     .padding(.horizontal)
 
@@ -49,8 +61,11 @@ struct ContentView: View {
                         if navigator.isRunning {
                             navigator.stopNavigation()
                             stopSpeechLoop()
+                            announcer.stopAllSpeech()
+                            announcer.deactivateAudioSession()
                         } else {
                             navigator.startNavigation()
+                            announcer.activateAudioSessionIfNeeded()
                             startSpeechLoop()
                         }
                     }) {
@@ -80,29 +95,73 @@ struct ContentView: View {
                 }
                 .padding(.bottom, geometry.safeAreaInsets.bottom)
             }
-            // GeometryReader takes all available height; to allow ScrollView to compute content size,
-            // wrap it in a fixed minHeight using an overlay container:
             .frame(maxWidth: .infinity, minHeight: 0)
         }
         .onAppear {
-            navigator.setupCamera()
+            navigator.prepareForUse()
+            setupDebounce()
         }
         .onDisappear {
             navigator.stopNavigation()
             stopSpeechLoop()
+            announcer.stopAllSpeech()
+            announcer.deactivateAudioSession()
+            ipCancellable?.cancel()
+            portCancellable?.cancel()
         }
+        .onChange(of: scenePhase) { old, newPhase in
+            switch newPhase {
+            case .active:
+                navigator.appBecameActive()
+                announcer.activateAudioSessionIfNeeded()
+                if navigator.isRunning {
+                    startSpeechLoop()
+                }
+            case .inactive, .background:
+                // Pause heavy work when not active
+                navigator.appWentToBackground()
+                stopSpeechLoop()
+                announcer.stopAllSpeech()
+                announcer.deactivateAudioSession()
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    private func setupDebounce() {
+        // Debounce changes to IP/port to avoid reconnect storms while typing
+        ipCancellable = navigator.$ip
+            .removeDuplicates()
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [weak navigator] _ in
+                navigator?.reconnectIfNeeded()
+            }
+
+        portCancellable = navigator.$port
+            .removeDuplicates()
+            .debounce(for: .milliseconds(600), scheduler: RunLoop.main)
+            .sink { [weak navigator] _ in
+                navigator?.reconnectIfNeeded()
+            }
     }
 
     private func startSpeechLoop() {
         stopSpeechLoop() // ensure only one task
         speechTask = Task.detached { [speechIntervalSeconds, announcer] in
-            // Run until cancelled
             while !Task.isCancelled {
-                // Speak immediately, then wait
+                // Respect Low Power Mode
+                if ProcessInfo.processInfo.isLowPowerModeEnabled {
+                    // Speak less frequently or skip entirely
+                    try? await Task.sleep(for: .seconds(max(30, speechIntervalSeconds * 2)))
+                    continue
+                }
+
                 await MainActor.run {
+                    // Only speak if session is active and not currently speaking
+                    announcer.activateAudioSessionIfNeeded()
                     announcer.speakRandomPhrase()
                 }
-                // Sleep for the interval; exit early if cancelled
                 try? await Task.sleep(for: .seconds(speechIntervalSeconds))
             }
         }

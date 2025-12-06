@@ -5,6 +5,7 @@ let languageCode = "en"
 class RobotAnnouncer: ObservableObject {
     
     private let synthesizer = AVSpeechSynthesizer()
+    private var isSessionActive = false
     
     private let phrases : [String] = languageCode=="ru" ?
         [
@@ -112,7 +113,42 @@ class RobotAnnouncer: ObservableObject {
     private lazy var preferredVoice: AVSpeechSynthesisVoice? = languageCode=="ru" ? selectPreferredRussianVoice() : selectPreferredVoice()
     private var didLogVoices = false
     
+    // MARK: - Public API
+    func activateAudioSessionIfNeeded() {
+        guard !isSessionActive else { return }
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // Playback allows speech even with Silent switch; adjust options if you want mixing
+            try session.setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
+            try session.setActive(true, options: [])
+            isSessionActive = true
+        } catch {
+            print("AVAudioSession activation failed: \(error)")
+            isSessionActive = false
+        }
+    }
+    
+    func deactivateAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(false, options: [.notifyOthersOnDeactivation])
+        } catch {
+            print("AVAudioSession deactivation failed: \(error)")
+        }
+        isSessionActive = false
+    }
+    
+    func stopAllSpeech() {
+        // Stop immediately; or set false to let it finish current utterance
+        synthesizer.stopSpeaking(at: .immediate)
+    }
+    
     func speakRandomPhrase() {
+        // Prevent enqueueing during active speech/paused state
+        guard !synthesizer.isSpeaking && !synthesizer.isPaused else { return }
+        
+        activateAudioSessionIfNeeded()
+        
         let text = phrases.randomElement() ?? "Movement detected."
         let utterance = AVSpeechUtterance(string: text)
         
@@ -121,7 +157,7 @@ class RobotAnnouncer: ObservableObject {
             utterance.voice = voice
         } else {
             // Final fallback: en-GB (may be male on some systems)
-            utterance.voice = AVSpeechSynthesisVoice(language: "en-GB")
+            utterance.voice = AVSpeechSynthesisVoice(language: languageCode=="ru" ? "ru-RU" : "en-GB")
         }
         
         // Optional: log available voices once to help diagnose

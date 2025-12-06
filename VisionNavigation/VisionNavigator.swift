@@ -13,6 +13,7 @@ import Network
 import SwiftUI
 internal import Combine
 
+@MainActor
 class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     // MARK: - Published properties for UI binding
     @Published var ip: String
@@ -30,24 +31,33 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
 
     // Networking
     private var udpConnection: NWConnection?
-    private let connectionQueue = DispatchQueue(label: "vision.navigator.udp")
+    private let connectionQueue = DispatchQueue(label: "vision.navigator.udp", qos: .utility)
 
     // Camera
     private var captureSession: AVCaptureSession?
+    private var videoOutput: AVCaptureVideoDataOutput?
+    private var cameraQueue = DispatchQueue(label: "camera.frame.queue", qos: .utility)
 
     // Optical flow
     @Published var lastPixelBuffer: CVPixelBuffer?
-    private let ciContext = CIContext()
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     // Depth processing
     private let depthProcessor: DepthProcessor? = DepthProcessor()
     private var lastBufferProcessingDate: Date = .distantPast
-    private let processingFPS: Double = 5.0
+    private var processingFPS: Double = 5.0
 
     // Command coalescing / rate limiting
     private var lastSentCommand: String?
     private var lastSendDate: Date = .distantPast
     private let minSendInterval: TimeInterval = 0.15
+
+    // Frame-skipping for command sending
+    private var frameCounter: Int = 0
+    var frameSkipModulo: Int = 1 // send on every Nth processed frame
+
+    // Thermal / power state tracking
+    private var thermalObserver: NSObjectProtocol?
 
     // MARK: - Init
     init(targetIP: String, port: UInt16) {
@@ -55,12 +65,40 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         self.port = String(port)
         super.init()
         setupConnection()
+        observeThermal()
+        adaptForPowerAndThermals()
+    }
+
+    deinit {
+        if let thermalObserver { NotificationCenter.default.removeObserver(thermalObserver) }
+    }
+
+    // MARK: - Lifecycle hooks
+    func prepareForUse() {
+        // Pre-warm connection; camera starts only when running
+        setupConnection()
+    }
+
+    func appBecameActive() {
+        adaptForPowerAndThermals()
+        if isRunning, captureSession == nil || !(captureSession?.isRunning ?? false) {
+            setupCamera()
+        }
+    }
+
+    func appWentToBackground() {
+        // Stop heavy work immediately
+        captureSession?.stopRunning()
+        captureSession = nil
+        videoOutput = nil
+        depthImage = nil
     }
 
     // MARK: - Public control methods for ContentView
     func startNavigation() {
         guard !isRunning else { return }
         isRunning = true
+        frameCounter = 0
         setupCamera()
         sendCommand("k 0") // ensure robot is stopped initially
         log("Started VisionNavigator")
@@ -72,45 +110,113 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         isRunning = false
         captureSession?.stopRunning()
         captureSession = nil
+        videoOutput = nil
+        lastPixelBuffer = nil
+        depthImage = nil
         sendCommand("k 0")
         log("Stopped VisionNavigator")
         updateStatus("Stopped")
     }
 
-    // Expose for .onAppear
+    // MARK: - Camera
     func setupCamera() {
+        // Configure once per start; adapt preset by power/thermal state
         let session = AVCaptureSession()
-        session.sessionPreset = .medium
+        session.beginConfiguration()
+        session.sessionPreset = capturePresetForCurrentState()
 
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input = try? AVCaptureDeviceInput(device: device) else {
             log("Camera error")
             updateStatus("Camera error")
+            session.commitConfiguration()
             return
         }
-        if session.canAddInput(input) {
-            session.addInput(input)
-        } else {
+        if session.canAddInput(input) { session.addInput(input) } else {
             log("Cannot add camera input")
             updateStatus("Camera input error")
+            session.commitConfiguration()
             return
         }
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "camera.frame.queue"))
-        if session.canAddOutput(output) {
-            session.addOutput(output)
-        } else {
+        output.setSampleBufferDelegate(self, queue: cameraQueue)
+        if session.canAddOutput(output) { session.addOutput(output) } else {
             log("Cannot add camera output")
             updateStatus("Camera output error")
+            session.commitConfiguration()
             return
         }
 
+        // Limit frame rate to reduce energy
+        do {
+            try device.lockForConfiguration()
+            if device.activeFormat.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= 15 }) {
+                device.activeVideoMinFrameDuration = CMTimeMake(value: 1, timescale: 15) // ~15 fps
+                device.activeVideoMaxFrameDuration = CMTimeMake(value: 1, timescale: 15)
+            }
+            device.unlockForConfiguration()
+        } catch {
+            log("Frame rate config error: \(error)")
+        }
+
+        session.commitConfiguration()
         session.startRunning()
+
         captureSession = session
+        videoOutput = output
         updateStatus("Camera running")
+    }
+
+    private func capturePresetForCurrentState() -> AVCaptureSession.Preset {
+        // Prefer lower resolutions on Low Power Mode or high thermal states
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        let thermal = ProcessInfo.processInfo.thermalState
+        if lowPower || thermal == .serious || thermal == .critical {
+            return .low
+        } else {
+            // Default to medium to save energy vs. high
+            return .medium
+        }
+    }
+
+    private func observeThermal() {
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.adaptForPowerAndThermals()
+        }
+    }
+
+    private func adaptForPowerAndThermals() {
+        // Adjust processing FPS dynamically
+        let lowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal, .fair:
+            processingFPS = lowPower ? 3.0 : 5.0
+        case .serious:
+            processingFPS = 2.0
+        case .critical:
+            processingFPS = 1.0
+        @unknown default:
+            processingFPS = 3.0
+        }
+
+        // If session is running, consider lowering preset/frame rate when state worsens
+        if let session = captureSession, session.isRunning {
+            let desiredPreset = capturePresetForCurrentState()
+            if session.sessionPreset != desiredPreset {
+                session.beginConfiguration()
+                if session.canSetSessionPreset(desiredPreset) {
+                    session.sessionPreset = desiredPreset
+                }
+                session.commitConfiguration()
+            }
+        }
     }
 
     // MARK: - NWConnection setup/update
@@ -123,11 +229,10 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         let connection = NWConnection(host: NWEndpoint.Host(ip), port: NWEndpoint.Port(integerLiteral: portValue), using: .udp)
         udpConnection = connection
         connection.start(queue: connectionQueue)
-        log("UDP connection started to \(ip):\(portValue)")
         updateStatus("Connected to \(ip):\(portValue)")
     }
 
-    private func reconnectIfNeeded() {
+    func reconnectIfNeeded() {
         // Recreate connection with current ip/port
         udpConnection?.cancel()
         udpConnection = nil
@@ -135,74 +240,65 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     }
 
     // MARK: - Frame Processing
-    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard isRunning else { return }
+    nonisolated func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // This delegate is called on cameraQueue (background). Hop to main actor for state changes.
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        // Existing optical flow logic
-//        if let last = lastPixelBuffer {
-//            analyzeOpticalFlow(prev: last, curr: pixelBuffer)
-//        }
-        lastPixelBuffer = pixelBuffer
+        Task { @MainActor in
+            // publish on main
+            self.lastPixelBuffer = pixelBuffer
+        }
 
-        // Throttled depth processing (≈5 FPS)
+        // Throttled depth processing with dynamic FPS
         let now = Date()
-        if now.timeIntervalSince(lastBufferProcessingDate) >= (1.0 / processingFPS) {
-            lastBufferProcessingDate = now
-            if let depthProcessor = depthProcessor {
-                depthProcessor.process(pixelBuffer: pixelBuffer) { [weak self] result in
-                    guard let self = self, let result = result else { return }
-                    // Publish to UI
-                    self.depthImage = result.colorizedImage
-                    self.regionStates = result.regionAverages.map { $0 < 0.5 ? "FAR" : "NEAR" }
+        // Read processingFPS/lastBufferProcessingDate safely by hopping to main to check/update them
+        Task { @MainActor in
+            let interval = 1.0 / max(1.0, self.processingFPS)
+            if now.timeIntervalSince(self.lastBufferProcessingDate) >= interval {
+                self.lastBufferProcessingDate = now
+                if let depthProcessor = self.depthProcessor {
+                    // DepthProcessor calls completion on main already
+                    depthProcessor.process(pixelBuffer: pixelBuffer) { [weak self] result in
+                        guard let self = self, let result = result else { return }
+                        // We are on main (DepthProcessor completes on main), and class is @MainActor
+                        self.depthImage = result.colorizedImage
+                        self.regionStates = result.regionAverages.map { $0 < 0.5 ? "FAR" : "NEAR" }
 
-                    // Decide and send command based on regions (parameterized + deduplicated)
-                    let cmd = self.commandForRegionStates(self.regionStates)
-                    self.sendCommand(cmd)
-                    self.status = "sending command \(cmd)"
+                        // Increment processed-frame counter and send only every Nth frame
+                        self.frameCounter &+= 1
+                        if self.frameSkipModulo <= 1 || (self.frameCounter % self.frameSkipModulo == 0) {
+                            let cmd = self.commandForRegionStates(self.regionStates)
+                            self.sendCommandCoalesced(cmd)
+                            self.updateStatus("sending command \(cmd)")
+                        } else {
+                            // Optionally update status without sending
+                            self.updateStatus("skipping frame \(self.frameCounter % self.frameSkipModulo)/\(self.frameSkipModulo)")
+                        }
+                    }
                 }
             }
         }
     }
 
     // MARK: - Region-based command decision
-    // Map [left, center, right] states to a command string.
     private func commandForRegionStates(_ states: [String]) -> String {
         let l = states[0], c = states[1], r = states[2]
 
         let turn = 180
         let forward = 90
 
-        // Consolidated logic from original if-chain:
-        if l == "NEAR" && c == "NEAR" && r == "NEAR" {
-            return "q \(turn)"
-        }
-        if l == "FAR" && c == "FAR" && r == "FAR" {
-            return "w \(forward)"
-        }
-        if l == "NEAR" && c == "FAR" && r == "FAR" {
-            return "e \(turn)"
-        }
-        if l == "FAR" && c == "NEAR" && r == "FAR" {
-            return "q \(turn)"
-        }
-        if l == "FAR" && c == "FAR" && r == "NEAR" {
-            return "q \(turn)"
-        }
-        if l == "FAR" && c == "NEAR" && r == "NEAR" {
-            return "q \(turn)"
-        }
-        if l == "NEAR" && c == "FAR" && r == "NEAR" {
-            return "w \(forward)"
-        }
-        if l == "NEAR" && c == "NEAR" && r == "FAR" {
-            return "e \(turn)"
-        }
+        if l == "NEAR" && c == "NEAR" && r == "NEAR" { return "q \(turn)" }
+        if l == "FAR" && c == "FAR" && r == "FAR" { return "w \(forward)" }
+        if l == "NEAR" && c == "FAR" && r == "FAR" { return "e \(turn)" }
+        if l == "FAR" && c == "NEAR" && r == "FAR" { return "q \(turn)" }
+        if l == "FAR" && c == "FAR" && r == "NEAR" { return "q \(turn)" }
+        if l == "FAR" && c == "NEAR" && r == "NEAR" { return "q \(turn)" }
+        if l == "NEAR" && c == "FAR" && r == "NEAR" { return "w \(forward)" }
+        if l == "NEAR" && c == "NEAR" && r == "FAR" { return "e \(turn)" }
         return "k 0"
     }
 
     private func sendCommandCoalesced(_ cmd: String) {
-        // Avoid sending the same command too frequently
         let now = Date()
         if cmd == lastSentCommand, now.timeIntervalSince(lastSendDate) < minSendInterval {
             return
@@ -212,55 +308,17 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
         sendCommand(cmd)
     }
 
-    // MARK: - Optical Flow
-    private func analyzeOpticalFlow(prev: CVPixelBuffer, curr: CVPixelBuffer) {
-        let currImage = CIImage(cvPixelBuffer: curr)
-        guard let avgLeft = averageBrightness(image: currImage.cropped(to: CGRect(x: 0, y: 0, width: currImage.extent.width/2, height: currImage.extent.height))),
-              let avgRight = averageBrightness(image: currImage.cropped(to: CGRect(x: currImage.extent.width/2, y: 0, width: currImage.extent.width/2, height: currImage.extent.height))) else {
-            return
-        }
-
-        let diff = avgLeft - avgRight
-
-        let threshold: Float = 0.05
-        let spd = max(0, min(255, Int(speed)))
-
-        if abs(diff) < threshold {
-            sendCommandCoalesced("w \(spd)") // forward
-        } else if diff > 0 { // right side obstacle
-            sendCommandCoalesced("q \(spd)") // turn left
-        } else { // left side obstacle
-            sendCommandCoalesced("e \(spd)") // turn right
-        }
-    }
-
-    private func averageBrightness(image: CIImage) -> Float? {
-        let extent = image.extent
-        let params: [String: Any] = [
-            kCIInputImageKey: image,
-            kCIInputExtentKey: CIVector(cgRect: extent)
-        ]
-        guard let filter = CIFilter(name: "CIAreaAverage", parameters: params) else {
-            return nil
-        }
-        guard let output = filter.outputImage else { return nil }
-
-        var bitmap = [UInt8](repeating: 0, count: 4)
-        ciContext.render(output, toBitmap: &bitmap, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), format: .RGBA8, colorSpace: nil)
-
-        let r = Float(bitmap[0]) / 255.0
-        let g = Float(bitmap[1]) / 255.0
-        let b = Float(bitmap[2]) / 255.0
-        return (r + g + b) / 3.0
-    }
-
     // MARK: - UDP
     private func sendCommand(_ cmd: String) {
-        if udpConnection == nil {
+        guard let connection = udpConnection else {
             setupConnection()
+            guard let connection = udpConnection else { return }
+            connection.send(content: cmd.data(using: .utf8), completion: .contentProcessed({ _ in }))
+            return
         }
-        udpConnection?.send(content: cmd.data(using: .utf8), completion: .contentProcessed({ _ in }))
-        log("Sent: \(cmd)")
+        connection.send(content: cmd.data(using: .utf8), completion: .contentProcessed({ _ in }))
+        // Avoid noisy logs to reduce console overhead and energy
+        // log("Sent: \(cmd)")
     }
 
     // MARK: - Helpers
@@ -271,8 +329,7 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     }
 
     private func updateStatus(_ msg: String) {
-        DispatchQueue.main.async {
-            self.status = msg
-        }
+        self.status = msg
     }
 }
+
