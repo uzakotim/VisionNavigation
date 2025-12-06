@@ -45,7 +45,7 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     // Depth processing
     private let depthProcessor: DepthProcessor? = DepthProcessor()
     private var lastBufferProcessingDate: Date = .distantPast
-    private var processingFPS: Double = 5.0
+    private var processingFPS: Double = 10.0
 
     // Command coalescing / rate limiting
     private var lastSentCommand: String?
@@ -54,7 +54,7 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
 
     // Frame-skipping for command sending
     private var frameCounter: Int = 0
-    var frameSkipModulo: Int = 1 // send on every Nth processed frame
+    var frameSkipModulo: Int = 2 // send on every Nth processed frame
 
     // Thermal / power state tracking
     private var thermalObserver: NSObjectProtocol?
@@ -262,7 +262,7 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
                         guard let self = self, let result = result else { return }
                         // We are on main (DepthProcessor completes on main), and class is @MainActor
                         self.depthImage = result.colorizedImage
-                        self.regionStates = result.regionAverages.map { $0 < 0.5 ? "FAR" : "NEAR" }
+                        self.regionStates = result.regionAverages.map { $0 < 0.4 ? "FAR" : "NEAR" }
 
                         // Increment processed-frame counter and send only every Nth frame
                         self.frameCounter &+= 1
