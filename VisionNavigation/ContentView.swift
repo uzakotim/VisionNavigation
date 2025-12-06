@@ -13,6 +13,9 @@ struct ContentView: View {
     @StateObject private var navigator = VisionNavigator(targetIP: "192.168.1.4", port: 8080)
     @State private var isLandscape: Bool = UIDevice.current.orientation.isLandscape
     @State private var isRunning = false
+    @StateObject private var announcer = RobotAnnouncer()
+    @State private var speechTask: Task<Void, Never>? = nil
+    @State private var speechIntervalSeconds: Double = 12 // adjust as desired
 
     var body: some View {
         ScrollView {
@@ -45,8 +48,10 @@ struct ContentView: View {
                     Button(action: {
                         if navigator.isRunning {
                             navigator.stopNavigation()
+                            stopSpeechLoop()
                         } else {
                             navigator.startNavigation()
+                            startSpeechLoop()
                         }
                     }) {
                         Text(navigator.isRunning ? "Stop" : "Start")
@@ -84,7 +89,27 @@ struct ContentView: View {
         }
         .onDisappear {
             navigator.stopNavigation()
+            stopSpeechLoop()
         }
     }
-}
 
+    private func startSpeechLoop() {
+        stopSpeechLoop() // ensure only one task
+        speechTask = Task.detached { [speechIntervalSeconds, announcer] in
+            // Run until cancelled
+            while !Task.isCancelled {
+                // Speak immediately, then wait
+                await MainActor.run {
+                    announcer.speakRandomPhrase()
+                }
+                // Sleep for the interval; exit early if cancelled
+                try? await Task.sleep(for: .seconds(speechIntervalSeconds))
+            }
+        }
+    }
+
+    private func stopSpeechLoop() {
+        speechTask?.cancel()
+        speechTask = nil
+    }
+}
