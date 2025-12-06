@@ -25,10 +25,6 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     @Published var depthImage: UIImage? = nil
     @Published var regionStates: [String] = ["FAR", "FAR", "FAR"]
 
-    // Parameterized speeds for region-based navigation
-    @Published var nearTurnSpeed: Int = 120   // used where previously "120"
-    @Published var farForwardSpeed: Int = 100 // used where previously "100"
-
     // MARK: - Public API
     var onLog: ((String) -> Void)?
 
@@ -174,8 +170,8 @@ class VisionNavigator: NSObject, ObservableObject, AVCaptureVideoDataOutputSampl
     private func commandForRegionStates(_ states: [String]) -> String {
         let l = states[0], c = states[1], r = states[2]
 
-        let turn = 150
-        let forward = 80
+        let turn = 180
+        let forward = 90
 
         // Consolidated logic from original if-chain:
         if l == "NEAR" && c == "NEAR" && r == "NEAR" {
